@@ -616,6 +616,20 @@ class AceStepLyricEncoder(AceStepPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
     ) -> BaseModelOutput:
+        """Encode lyric text embeddings through transformer layers.
+
+        Args:
+            input_ids: Must be None (only inputs_embeds is supported).
+            attention_mask: Attention mask for lyric sequence.
+            position_ids: Optional positional IDs.
+            inputs_embeds: Input lyric embeddings.
+            output_attentions: Whether to output attention weights.
+            output_hidden_states: Whether to output intermediate hidden states.
+            flash_attn_kwargs: Extra keyword arguments for flash attention.
+
+        Returns:
+            BaseModelOutput containing last_hidden_state and optional hidden states.
+        """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -625,116 +639,134 @@ class AceStepLyricEncoder(AceStepPreTrainedModel):
         assert attention_mask is not None, "Attention mask must be provided for the lyric encoder."
         assert inputs_embeds is not None, "Inputs embeddings must be provided for the lyric encoder."
 
-        # Project input embeddings: N x T x text_hidden_dim -> N x T x hidden_size
-        inputs_embeds = self.embed_tokens(inputs_embeds)
-        # Cache position: only used for mask construction (not for actual caching)
-        cache_position = torch.arange(0, inputs_embeds.shape[1], device=inputs_embeds.device)
+        # In float16 on pre-Ampere GPUs, intermediate MLP dot products in deep layers
+        # can exceed the 65,504 limit, resulting in inf and subsequent NaN from RMSNorm.
+        # Upcasting to float32 prevents overflow with zero overhead on bfloat16/float32.
+        orig_dtype = inputs_embeds.dtype
+        is_fp16 = (orig_dtype == torch.float16)
+        if is_fp16:
+            self.float()
+            inputs_embeds = inputs_embeds.float()
 
-        # Positional IDs
-        if position_ids is None:
-            position_ids = cache_position.unsqueeze(0)
+        try:
+            # Project input embeddings: N x T x text_hidden_dim -> N x T x hidden_size
+            inputs_embeds = self.embed_tokens(inputs_embeds)
+            # Cache position: only used for mask construction (not for actual caching)
+            cache_position = torch.arange(0, inputs_embeds.shape[1], device=inputs_embeds.device)
 
-        # Attention masks
-        seq_len = inputs_embeds.shape[1]
-        dtype = inputs_embeds.dtype
-        device = inputs_embeds.device
+            # Positional IDs
+            if position_ids is None:
+                position_ids = cache_position.unsqueeze(0)
 
-        # 判断是否使用 Flash Attention 2
-        is_flash_attn = (self.config._attn_implementation == "flash_attention_2")
+            # Attention masks
+            seq_len = inputs_embeds.shape[1]
+            dtype = inputs_embeds.dtype
+            device = inputs_embeds.device
 
-        # 初始化 Mask 变量
-        full_attn_mask = None
-        sliding_attn_mask = None
+            # 判断是否使用 Flash Attention 2
+            is_flash_attn = (self.config._attn_implementation == "flash_attention_2")
 
-        if is_flash_attn:
-            # -------------------------------------------------------
-            # 场景 A: Flash Attention 模式
-            # -------------------------------------------------------
-            # FA 不需要 4D Mask。
-            # 如果有 padding mask (attention_mask [B, L])，直接传给它即可。
-            # 如果没有 padding mask，传 None。
-            # 滑动窗口逻辑由 Layer 内部传给 FA kernel 的 sliding_window 参数控制。
-            full_attn_mask = attention_mask
+            # 初始化 Mask 变量
+            full_attn_mask = None
+            sliding_attn_mask = None
 
-            # 这里的逻辑是：如果配置启用了滑动窗口，FA 模式下我们也只需要传基础的 padding mask
-            # Layer 会自己决定是否调用带 sliding window 的 kernel
-            sliding_attn_mask = attention_mask if self.config.use_sliding_window else None
+            if is_flash_attn:
+                # -------------------------------------------------------
+                # 场景 A: Flash Attention 模式
+                # -------------------------------------------------------
+                # FA 不需要 4D Mask。
+                # 如果有 padding mask (attention_mask [B, L])，直接传给它即可。
+                # 如果没有 padding mask，传 None。
+                # 滑动窗口逻辑由 Layer 内部传给 FA kernel 的 sliding_window 参数控制。
+                full_attn_mask = attention_mask
 
-        else:
-            # -------------------------------------------------------
-            # 场景 B: CPU / Mac / SDPA (Eager 模式)
-            # -------------------------------------------------------
-            # 必须手动生成 4D Mask [B, 1, L, L]
+                # 这里的逻辑是：如果配置启用了滑动窗口，FA 模式下我们也只需要传基础的 padding mask
+                # Layer 会自己决定是否调用带 sliding window 的 kernel
+                sliding_attn_mask = attention_mask if self.config.use_sliding_window else None
 
-            # 1. Full Attention (Bidirectional, Global)
-            # 对应原来的 create_causal_mask + bidirectional
-            full_attn_mask = create_4d_mask(
-                seq_len=seq_len,
-                dtype=dtype,
-                device=device,
-                attention_mask=attention_mask,     # [B, L]
-                sliding_window=None,
-                is_sliding_window=False,
-                is_causal=False                    # <--- 关键：双向注意力
-            )
+            else:
+                # -------------------------------------------------------
+                # 场景 B: CPU / Mac / SDPA (Eager 模式)
+                # -------------------------------------------------------
+                # 必须手动生成 4D Mask [B, 1, L, L]
 
-            # 2. Sliding Attention (Bidirectional, Local)
-            # 对应原来的 create_sliding_window... + bidirectional
-            if self.config.use_sliding_window:
-                sliding_attn_mask = create_4d_mask(
+                # 1. Full Attention (Bidirectional, Global)
+                # 对应原来的 create_causal_mask + bidirectional
+                full_attn_mask = create_4d_mask(
                     seq_len=seq_len,
                     dtype=dtype,
                     device=device,
-                    attention_mask=attention_mask, # [B, L]
-                    sliding_window=self.config.sliding_window,
-                    is_sliding_window=True,        # <--- 开启滑动窗口
-                    is_causal=False                # <--- 关键：双向注意力
+                    attention_mask=attention_mask,     # [B, L]
+                    sliding_window=None,
+                    is_sliding_window=False,
+                    is_causal=False                    # <--- 关键：双向注意力
                 )
 
-        # 构建 Mapping
-        self_attn_mask_mapping = {
-            "full_attention": full_attn_mask,
-            "sliding_attention": sliding_attn_mask,
-        }
+                # 2. Sliding Attention (Bidirectional, Local)
+                # 对应原来的 create_sliding_window... + bidirectional
+                if self.config.use_sliding_window:
+                    sliding_attn_mask = create_4d_mask(
+                        seq_len=seq_len,
+                        dtype=dtype,
+                        device=device,
+                        attention_mask=attention_mask, # [B, L]
+                        sliding_window=self.config.sliding_window,
+                        is_sliding_window=True,        # <--- 开启滑动窗口
+                        is_causal=False                # <--- 关键：双向注意力
+                    )
 
-        # Initialize hidden states with input embeddings
-        hidden_states = inputs_embeds
+            # 构建 Mapping
+            self_attn_mask_mapping = {
+                "full_attention": full_attn_mask,
+                "sliding_attention": sliding_attn_mask,
+            }
 
-        # Create position embeddings to be shared across all layers
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+            # Initialize hidden states with input embeddings
+            hidden_states = inputs_embeds
 
-        # Pass through transformer layers
-        all_hidden_states = () if output_hidden_states else None
-        all_self_attns = () if output_attentions else None
+            # Create position embeddings to be shared across all layers
+            position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
-        for layer_module in self.layers[: self.config.num_hidden_layers]:
+            # Pass through transformer layers
+            all_hidden_states = () if output_hidden_states else None
+            all_self_attns = () if output_attentions else None
+
+            for layer_module in self.layers[: self.config.num_hidden_layers]:
+                if output_hidden_states:
+                    all_hidden_states += (hidden_states,)
+
+                layer_outputs = layer_module(
+                    hidden_states,
+                    position_embeddings,
+                    self_attn_mask_mapping[layer_module.attention_type],
+                    position_ids,
+                    output_attentions,
+                    **flash_attn_kwargs,
+                )
+
+                hidden_states = layer_outputs[0]
+
+                if output_attentions:
+                    all_self_attns += (layer_outputs[1],)
+
+            hidden_states = self.norm(hidden_states)
+
+            if is_fp16:
+                hidden_states = hidden_states.to(orig_dtype)
+                if all_hidden_states is not None:
+                    all_hidden_states = tuple(h.to(orig_dtype) for h in all_hidden_states)
+
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            layer_outputs = layer_module(
-                hidden_states,
-                position_embeddings,
-                self_attn_mask_mapping[layer_module.attention_type],
-                position_ids,
-                output_attentions,
-                **flash_attn_kwargs,
+            return BaseModelOutput(
+                last_hidden_state=hidden_states,
+                hidden_states=all_hidden_states,
+                attentions=all_self_attns,
             )
-
-            hidden_states = layer_outputs[0]
-
-            if output_attentions:
-                all_self_attns += (layer_outputs[1],)
-
-        hidden_states = self.norm(hidden_states)
-
-        if output_hidden_states:
-            all_hidden_states += (hidden_states,)
-
-        return BaseModelOutput(
-            last_hidden_state=hidden_states,
-            hidden_states=all_hidden_states,
-            attentions=all_self_attns,
-        )
+        finally:
+            if is_fp16:
+                self.to(orig_dtype)
 
 
 class AttentionPooler(AceStepPreTrainedModel):
