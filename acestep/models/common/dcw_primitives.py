@@ -39,7 +39,10 @@ def dcw_pix(x: torch.Tensor, y: torch.Tensor, scaler: float) -> torch.Tensor:
     """
     if scaler == 0.0:
         return x
-    return x + scaler * (x - y)
+    res = x + scaler * (x - y)
+    if x.dtype == torch.float16:
+        res = torch.clamp(res, -65000.0, 65000.0)
+    return res
 
 
 def _dwt_pair(x: torch.Tensor, y: torch.Tensor, wavelet: str):
@@ -91,6 +94,8 @@ def dcw_low(
     xl, xh, yl, _yh, iwt, out_T = pair
     xl = xl + scaler * (xl - yl)
     x_new = iwt((xl, xh))
+    if x.dtype == torch.float16:
+        x_new = torch.clamp(x_new, -65000.0, 65000.0)
     return _bct_to_btc(x_new[:, :, :out_T]).to(dtype=x.dtype)
 
 
@@ -106,6 +111,8 @@ def dcw_high(
     xl, xh, _yl, yh, iwt, out_T = pair
     xh_new = [xhi + scaler * (xhi - yhi) for xhi, yhi in zip(xh, yh, strict=True)]
     x_new = iwt((xl, xh_new))
+    if x.dtype == torch.float16:
+        x_new = torch.clamp(x_new, -65000.0, 65000.0)
     return _bct_to_btc(x_new[:, :, :out_T]).to(dtype=x.dtype)
 
 
@@ -128,4 +135,6 @@ def dcw_double(
     if high_scaler != 0.0:
         xh = [xhi + high_scaler * (xhi - yhi) for xhi, yhi in zip(xh, yh, strict=True)]
     x_new = iwt((xl, xh))
+    if x.dtype == torch.float16:
+        x_new = torch.clamp(x_new, -65000.0, 65000.0)
     return _bct_to_btc(x_new[:, :, :out_T]).to(dtype=x.dtype)

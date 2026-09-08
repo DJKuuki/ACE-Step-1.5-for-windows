@@ -36,6 +36,7 @@ Usage inside a sampler step::
 
 from __future__ import annotations
 
+import os
 import torch
 from loguru import logger
 
@@ -86,6 +87,9 @@ class DCWCorrector:
             raise ValueError(
                 f"Invalid dcw_mode='{mode}'. Expected one of {VALID_DCW_MODES}."
             )
+        env_dcw = os.getenv("ACESTEP_DCW_ENABLED")
+        if env_dcw is not None:
+            enabled = env_dcw.lower() in ("1", "true", "yes")
         self.enabled = bool(enabled)
         self.mode = mode
         self.scaler = float(scaler)
