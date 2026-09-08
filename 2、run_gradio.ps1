@@ -35,6 +35,8 @@ foreach ($Path in $VenvPaths) {
   }
 }
 
+$Env:PYTHONIOENCODING = "utf-8"
+$Env:PYTHONUTF8 = "1"
 $Env:HF_HOME = "huggingface"
 $Env:XFORMERS_FORCE_DISABLE_TRITON = "1"
 #$Env:HF_ENDPOINT = "https://hf-mirror.com"
