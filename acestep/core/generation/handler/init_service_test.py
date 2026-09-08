@@ -90,6 +90,10 @@ class _Host(InitServiceMixin):
         """Stub MLX VAE init hook and always report unavailable in tests."""
         return False
 
+    def _sync_alignment_config(self) -> None:
+        """Stub alignment config sync hook for tests."""
+        pass
+
 
 class InitServiceMixinTests(unittest.TestCase):
     """Behavioral tests for InitServiceMixin helpers and initialization flow."""
@@ -900,6 +904,47 @@ class _VaeHost(_Host):
     _get_vae_dtype = MEMORY_UTILS_MODULE.MemoryUtilsMixin._get_vae_dtype
 
 
+class CudaDtypeTests(unittest.TestCase):
+    """Tests verifying safe dtype selection for CUDA devices, honoring ACESTEP_DTYPE."""
+
+    def test_resolve_cuda_dtype_defaults_to_bfloat16_when_supported(self):
+        """It returns bfloat16 on Ampere+ CUDA GPUs when ACESTEP_DTYPE is not set."""
+        with patch.dict("os.environ", {}, clear=False), \
+                patch.object(GPU_CONFIG_MODULE, "cuda_supports_bfloat16", return_value=True):
+            os.environ.pop("ACESTEP_DTYPE", None)
+            result = ORCHESTRATOR_MODULE._resolve_cuda_dtype()
+        self.assertEqual(result, torch.bfloat16)
+
+    def test_resolve_cuda_dtype_defaults_to_float16_when_bfloat16_unsupported(self):
+        """It falls back to float16 on pre-Ampere CUDA GPUs when ACESTEP_DTYPE is not set."""
+        with patch.dict("os.environ", {}, clear=False), \
+                patch.object(GPU_CONFIG_MODULE, "cuda_supports_bfloat16", return_value=False):
+            os.environ.pop("ACESTEP_DTYPE", None)
+            result = ORCHESTRATOR_MODULE._resolve_cuda_dtype()
+        self.assertEqual(result, torch.float16)
+
+    def test_resolve_cuda_dtype_respects_float32_override(self):
+        """It returns float32 when ACESTEP_DTYPE=float32 even on pre-Ampere GPU."""
+        with patch.dict("os.environ", {"ACESTEP_DTYPE": "float32"}), \
+                patch.object(GPU_CONFIG_MODULE, "cuda_supports_bfloat16", return_value=False):
+            result = ORCHESTRATOR_MODULE._resolve_cuda_dtype()
+        self.assertEqual(result, torch.float32)
+
+    def test_resolve_cuda_dtype_respects_bfloat16_override(self):
+        """It returns bfloat16 when ACESTEP_DTYPE=bfloat16."""
+        with patch.dict("os.environ", {"ACESTEP_DTYPE": "bfloat16"}), \
+                patch.object(GPU_CONFIG_MODULE, "cuda_supports_bfloat16", return_value=False):
+            result = ORCHESTRATOR_MODULE._resolve_cuda_dtype()
+        self.assertEqual(result, torch.bfloat16)
+
+    def test_resolve_cuda_dtype_unknown_value_falls_back_to_auto(self):
+        """It falls back to auto-detection for unknown ACESTEP_DTYPE values."""
+        with patch.dict("os.environ", {"ACESTEP_DTYPE": "unknown_dtype"}), \
+                patch.object(GPU_CONFIG_MODULE, "cuda_supports_bfloat16", return_value=False):
+            result = ORCHESTRATOR_MODULE._resolve_cuda_dtype()
+        self.assertEqual(result, torch.float16)
+
+
 class RocmDtypeTests(unittest.TestCase):
     """Tests verifying safe dtype selection for ROCm/HIP devices."""
 
@@ -1071,14 +1116,14 @@ class RocmDtypeTests(unittest.TestCase):
             result = host._get_vae_dtype("cuda")
         self.assertEqual(result, torch.bfloat16)
 
-    def test_get_vae_dtype_returns_float16_on_pre_ampere_cuda(self):
-        """It returns float16 for VAE on pre-Ampere CUDA devices."""
+    def test_get_vae_dtype_returns_float32_on_pre_ampere_cuda(self):
+        """It returns float32 for VAE on pre-Ampere CUDA devices to prevent overflow."""
         host = _VaeHost(project_root="K:/fake_root", device="cuda")
         host.dtype = torch.float32
         with patch.object(MEMORY_UTILS_MODULE, "is_rocm_available", return_value=False), \
                 patch.object(MEMORY_UTILS_MODULE, "cuda_supports_bfloat16", return_value=False):
             result = host._get_vae_dtype("cuda")
-        self.assertEqual(result, torch.float16)
+        self.assertEqual(result, torch.float32)
 
     def test_get_vae_dtype_treats_cuda_index_device_as_cuda(self):
         """It treats device strings like ``cuda:1`` as CUDA for VAE dtype selection."""

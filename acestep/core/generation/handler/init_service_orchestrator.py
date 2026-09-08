@@ -16,10 +16,47 @@ _ROCM_DTYPE_MAP = {
     "bfloat16": torch.bfloat16,
 }
 
+_CUDA_DTYPE_MAP = {
+    "float32": torch.float32,
+    "fp32": torch.float32,
+    "float16": torch.float16,
+    "fp16": torch.float16,
+    "bfloat16": torch.bfloat16,
+    "bf16": torch.bfloat16,
+}
+
 
 def _cuda_supports_bfloat16() -> bool:
     """Return whether the active CUDA device supports native bfloat16 kernels."""
     return gpu_config.cuda_supports_bfloat16()
+
+
+def _resolve_cuda_dtype() -> torch.dtype:
+    """Return model dtype for CUDA devices, honoring ACESTEP_DTYPE if set.
+
+    Pre-Ampere CUDA GPUs (e.g. GTX 16xx / Turing) default to ``float16``,
+    which can produce numerical overflow (NaN latents) on long sequences.
+    Set the ``ACESTEP_DTYPE`` environment variable to ``float32`` to prevent overflow.
+    """
+    raw = os.environ.get("ACESTEP_DTYPE", "").strip().lower()
+    if raw:
+        dtype = _CUDA_DTYPE_MAP.get(raw)
+        if dtype is not None:
+            logger.info(
+                f"[initialize_service] ACESTEP_DTYPE override active: using dtype={dtype}"
+            )
+            return dtype
+        logger.warning(
+            f"[initialize_service] Unknown ACESTEP_DTYPE={raw!r}; "
+            "falling back to auto-detection."
+        )
+    if gpu_config.cuda_supports_bfloat16():
+        return torch.bfloat16
+    logger.info(
+        "[initialize_service] Pre-Ampere CUDA detected: "
+        "using float16 instead of bfloat16 (set ACESTEP_DTYPE=float32 to prevent overflow)."
+    )
+    return torch.float16
 
 
 def _resolve_rocm_dtype() -> torch.dtype:
@@ -181,14 +218,7 @@ class InitServiceOrchestratorMixin:
                     "(set ACESTEP_ROCM_DTYPE=bfloat16 or float16 to override)"
                 )
             elif resolved_device == "cuda":
-                if gpu_config.cuda_supports_bfloat16():
-                    self.dtype = torch.bfloat16
-                else:
-                    self.dtype = torch.float16
-                    logger.info(
-                        "[initialize_service] Pre-Ampere CUDA detected: "
-                        "using float16 instead of bfloat16."
-                    )
+                self.dtype = _resolve_cuda_dtype()
             else:
                 self.dtype = torch.bfloat16 if resolved_device == "xpu" else torch.float32
             self.quantization = normalized_quantization

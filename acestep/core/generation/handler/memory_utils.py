@@ -206,7 +206,7 @@ class MemoryUtilsMixin:
                 return getattr(self, "dtype", torch.float32)
             if cuda_supports_bfloat16(_cuda_device_index(target_device)):
                 return torch.bfloat16
-            return torch.float16
+            return torch.float32
         if target_device == "xpu":
             return torch.bfloat16
         if target_device == "mps":

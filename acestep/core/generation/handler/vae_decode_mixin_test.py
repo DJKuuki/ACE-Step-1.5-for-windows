@@ -69,6 +69,23 @@ class VaeDecodeMixinTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             host.tiled_decode(torch.zeros(1, 4, 32), chunk_size=32, overlap=8)
 
+    def test_tiled_decode_aligns_latents_to_vae_dtype(self):
+        """Latents with mismatched dtype are automatically aligned to VAE dtype."""
+        host = _DecodeHost()
+        from types import SimpleNamespace
+        host.vae = SimpleNamespace(dtype=torch.float32)
+
+        captured_dtype = None
+
+        def _capture_inner(latents, *args, **kwargs):
+            nonlocal captured_dtype
+            captured_dtype = latents.dtype
+            return torch.zeros(1, 2, 8)
+
+        host._tiled_decode_inner = _capture_inner
+        host.tiled_decode(torch.zeros(1, 4, 32, dtype=torch.float16), chunk_size=32, overlap=8)
+        self.assertEqual(captured_dtype, torch.float32)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -58,6 +58,11 @@ class VaeDecodeMixin:
             f"latents_shape={latents.shape}"
         )
 
+        vae = getattr(self, "vae", None)
+        vae_dtype = getattr(vae, "dtype", None)
+        if vae_dtype is not None:
+            latents = latents.to(vae_dtype)
+
         # MPS Conv1d has a hard output-size limit during temporal upsampling.
         _is_mps = self.device == "mps"
         if _is_mps:

@@ -168,6 +168,10 @@ class GenerateMusicDecodeMixin:
                         pred_latents_for_decode = pred_latents_for_decode.cpu()
                         self._empty_cache()
                 try:
+                    vae = getattr(self, "vae", None)
+                    vae_dtype = getattr(vae, "dtype", None)
+                    if vae_dtype is not None and hasattr(pred_latents_for_decode, "to"):
+                        pred_latents_for_decode = pred_latents_for_decode.to(vae_dtype)
                     if use_tiled_decode:
                         logger.info("[generate_music] Using tiled VAE decode to reduce VRAM usage...")
                         pred_wavs = self.tiled_decode(pred_latents_for_decode)
